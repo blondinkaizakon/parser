@@ -1,0 +1,385 @@
+import time
+import datetime
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+import re
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+import random
+
+
+def wait_random():
+    """Случайная пауза для имитации человеческого поведения"""
+    time.sleep(random.uniform(1, 3))
+
+
+def main():
+    print("=== ЗАПУСК ПАРСЕРА С JS-ПАГИНАЦИЕЙ ===")
+    
+    chrome_options = Options()
+    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-extensions')
+    chrome_options.add_argument('--disable-popup-blocking')
+    chrome_options.add_argument('--start-maximized')
+    chrome_options.add_argument('--disable-web-security')
+    chrome_options.add_argument('--allow-running-insecure-content')
+    
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.set_page_load_timeout(60)
+        
+        print("Открываем сайт kad.arbitr.ru...")
+        driver.get("https://kad.arbitr.ru/")
+        wait = WebDriverWait(driver, 60)
+        wait_random()
+
+        if "kad.arbitr.ru" not in driver.current_url:
+            print("Ошибка: не удалось загрузить страницу kad.arbitr.ru")
+            return
+            
+        print("=== УСТАНОВКА ФИЛЬТРОВ ===")
+        
+        # Выбор суда - АС города Москвы
+        print("Выбираем суд АС города Москвы...")
+        court_input = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input.js-input[placeholder='название суда']")))
+        court_input.clear()
+        wait_random()
+        court_input.send_keys("АС города Москвы")
+        wait_random()
+
+        try:
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "ul.js-suggestions li")))
+            court_input.send_keys(Keys.DOWN)
+            wait_random()
+            court_input.send_keys(Keys.ENTER)
+            print("Суд выбран успешно")
+        except Exception as e:
+            print(f"Ошибка при выборе суда: {e}")
+            court_input.send_keys(Keys.TAB)
+            wait_random()
+
+        wait_random()
+
+        # Установка дат
+        print("Устанавливаем даты...")
+        date_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text'][placeholder='дд.мм.гггг']")
+        today = datetime.datetime.now()
+        yesterday = today - datetime.timedelta(days=1)
+        yesterday_str = yesterday.strftime("%d.%m.%Y")
+        today_str = today.strftime("%d.%m.%Y")
+
+        if len(date_inputs) >= 2:
+            date_inputs[0].clear()
+            date_inputs[0].send_keys(yesterday_str)
+            print(f"Дата ОТ: {yesterday_str}")
+            wait_random()
+            date_inputs[1].clear()
+            date_inputs[1].send_keys(today_str)
+            print(f"Дата ДО: {today_str}")
+            wait_random()
+            
+            # Клик вне поля для фиксации дат
+            driver.find_element(By.TAG_NAME, "body").click()
+            wait_random()
+            date_inputs[1].send_keys(Keys.ESCAPE)
+            wait_random()
+            
+        print("Нажимаем кнопку поиска...")
+        find_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        driver.execute_script("arguments[0].click();", find_btn)
+        time.sleep(5)
+        
+        print("=== ФИЛЬТРЫ УСТАНОВЛЕНЫ, НАЧИНАЕМ ПАРСИНГ ===")
+        
+        results = []
+        page = 1
+        max_pages = 50
+        processed_cases = set()
+        
+        while True:
+            print(f"\n=== СТРАНИЦА {page} ===")
+            
+            if page > max_pages:
+                print(f"Достигнуто максимальное количество страниц ({max_pages}). Завершаем парсинг.")
+                break
+                
+            try:
+                print("Ждем загрузки таблицы результатов...")
+                wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "table#b-cases > tbody > tr")))
+            except Exception as e:
+                if "429" in driver.page_source or "Too Many Requests" in driver.page_source:
+                    print("Обнаружена ошибка 429. Жду 10 минут...")
+                    time.sleep(600)
+                    continue
+                else:
+                    print(f"Ошибка при загрузке таблицы: {e}")
+                    break
+                    
+            rows = driver.find_elements(By.CSS_SELECTOR, "table#b-cases > tbody > tr")
+            print(f"Найдено строк в таблице: {len(rows)}")
+
+            moscow_cases_count = 0
+            for row in rows:
+                try:
+                    case_number = row.find_element(By.CSS_SELECTOR, "td.num a.num_case").text.strip()
+                    case_date = row.find_element(By.CSS_SELECTOR, "td.num span").text.strip()
+                    court_divs = row.find_elements(By.CSS_SELECTOR, "td.court div[title]")
+                    court = court_divs[-1].get_attribute("title") if court_divs else ""
+
+                    if not any(keyword in court.lower() for keyword in
+                               ["ас города москвы", "арбитражный суд города москвы", "ас г. москвы"]):
+                        continue
+
+                    if case_number in processed_cases:
+                        continue
+                        
+                    processed_cases.add(case_number)
+                    moscow_cases_count += 1
+                    print(f"Обрабатываем дело {case_number}")
+                    
+                    plaintiffs = row.find_elements(By.CSS_SELECTOR, "td.plaintiff span.js-rollover")
+                    istets_names, istets_inns, istets_ogrns = [], [], []
+                    for p in plaintiffs:
+                        istets_names.append(p.text.strip())
+                        try:
+                            rollover = p.find_element(By.CSS_SELECTOR, "span.js-rolloverHtml")
+                            inn_match = re.search(r"ИНН: ([0-9]+)", rollover.get_attribute("innerHTML"))
+                            ogrn_match = re.search(r"ОГРН: ([0-9]+)", rollover.get_attribute("innerHTML"))
+                            istets_inns.append(inn_match.group(1) if inn_match else "")
+                            istets_ogrns.append(ogrn_match.group(1) if ogrn_match else "")
+                        except Exception:
+                            istets_inns.append("")
+                            istets_ogrns.append("")
+                            
+                    respondents = row.find_elements(By.CSS_SELECTOR, "td.respondent span.js-rollover")
+                    otv_names, otv_inns, otv_ogrns = [], [], []
+                    for r in respondents:
+                        otv_names.append(r.text.strip())
+                        try:
+                            rollover = r.find_element(By.CSS_SELECTOR, "span.js-rolloverHtml")
+                            inn_match = re.search(r"ИНН: ([0-9]+)", rollover.get_attribute("innerHTML"))
+                            ogrn_match = re.search(r"ОГРН: ([0-9]+)", rollover.get_attribute("innerHTML"))
+                            otv_inns.append(inn_match.group(1) if inn_match else "")
+                            otv_ogrns.append(ogrn_match.group(1) if ogrn_match else "")
+                        except Exception:
+                            otv_inns.append("")
+                            otv_ogrns.append("")
+                            
+                    card_link = row.find_element(By.CSS_SELECTOR, "td.num a.num_case").get_attribute("href")
+                    
+                    for i, (istets_name, istets_inn, istets_ogrn) in enumerate(zip(istets_names, istets_inns, istets_ogrns)):
+                        for j, (otv_name, otv_inn, otv_ogrn) in enumerate(zip(otv_names, otv_inns, otv_ogrns)):
+                            try:
+                                driver.execute_script("window.open(arguments[0]);", card_link)
+                                driver.switch_to.window(driver.window_handles[-1])
+                                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
+                                
+                                try:
+                                    claim_price_elem = driver.find_element(By.XPATH,
+                                                                           "//*[contains(text(),'Сумма иска')]/following-sibling::*[1]")
+                                    claim_price = claim_price_elem.text.strip()
+                                except Exception:
+                                    claim_price = ""
+                                    
+                                wait_random()
+                            finally:
+                                driver.close()
+                                driver.switch_to.window(driver.window_handles[0])
+                                
+                            results.append({
+                                "case_date": case_date,
+                                "case_number": case_number,
+                                "court": court,
+                                "istets_name": istets_name,
+                                "istets_inn": istets_inn,
+                                "istets_ogrn": istets_ogrn,
+                                "otv_name": otv_name,
+                                "otv_inn": otv_inn,
+                                "otv_ogrn": otv_ogrn,
+                                "claim_price": claim_price
+                            })
+                except Exception as e:
+                    print(f"Ошибка при обработке строки: {e}")
+                    continue
+
+            print(f"На странице {page} обработано {moscow_cases_count} дел из АС города Москвы")
+
+            # ИСПРАВЛЕННАЯ JS-ПАГИНАЦИЯ
+            print("\n--- ПЕРЕХОД НА СЛЕДУЮЩУЮ СТРАНИЦУ ---")
+            
+            try:
+                # Проверяем, что мы все еще на странице с результатами
+                current_url = driver.current_url
+                print(f"Текущий URL: {current_url}")
+                
+                if "kad.arbitr.ru" in current_url and "search" not in current_url:
+                    print("ОШИБКА: Вернулись на главную страницу. Завершаем парсинг.")
+                    break
+                
+                # Ищем кнопку "вперед"
+                next_buttons = driver.find_elements(By.CSS_SELECTOR, "ul#pages li.rarr a")
+                if not next_buttons:
+                    print("Кнопка 'вперёд' не найдена - достигнут конец результатов.")
+                    break
+                    
+                next_btn = next_buttons[0]
+                
+                # Проверяем, активна ли кнопка
+                if "disabled" in next_btn.get_attribute("class") or not next_btn.is_enabled():
+                    print("Кнопка 'вперёд' неактивна - достигнут конец результатов.")
+                    break
+                    
+                # Запоминаем номер первого дела на текущей странице
+                first_case_number = rows[0].find_element(By.CSS_SELECTOR, "td.num a.num_case").text.strip()
+                print(f"Текущее первое дело: {first_case_number}")
+                
+                # Получаем номер следующей страницы
+                try:
+                    current_page_elements = driver.find_elements(By.CSS_SELECTOR, "ul#pages li.active a")
+                    if current_page_elements:
+                        current_page_text = current_page_elements[0].text.strip()
+                        print(f"Текущая страница: {current_page_text}")
+                        next_page_num = int(current_page_text) + 1
+                        print(f"Следующая страница: {next_page_num}")
+                    else:
+                        next_page_num = page + 1
+                except:
+                    next_page_num = page + 1
+                
+                # Пробуем разные способы перехода
+                page_changed = False
+                
+                # Способ 1: JavaScript клик
+                print("Способ 1: JavaScript клик...")
+                try:
+                    driver.execute_script("arguments[0].click();", next_btn)
+                    time.sleep(8)
+                    
+                    # Проверяем результат
+                    new_rows = driver.find_elements(By.CSS_SELECTOR, "table#b-cases > tbody > tr")
+                    if new_rows:
+                        new_first_case = new_rows[0].find_element(By.CSS_SELECTOR, "td.num a.num_case").text.strip()
+                        if new_first_case != first_case_number:
+                            print(f"УСПЕХ: JavaScript клик сработал! Новое дело: {new_first_case}")
+                            page_changed = True
+                        else:
+                            print("JavaScript клик не сработал")
+                except Exception as e:
+                    print(f"Ошибка при JavaScript клике: {e}")
+                
+                # Способ 2: Прямой клик
+                if not page_changed:
+                    print("Способ 2: Прямой клик...")
+                    try:
+                        next_btn.click()
+                        time.sleep(8)
+                        
+                        # Проверяем результат
+                        new_rows = driver.find_elements(By.CSS_SELECTOR, "table#b-cases > tbody > tr")
+                        if new_rows:
+                            new_first_case = new_rows[0].find_element(By.CSS_SELECTOR, "td.num a.num_case").text.strip()
+                            if new_first_case != first_case_number:
+                                print(f"УСПЕХ: Прямой клик сработал! Новое дело: {new_first_case}")
+                                page_changed = True
+                            else:
+                                print("Прямой клик не сработал")
+                    except Exception as e:
+                        print(f"Ошибка при прямом клике: {e}")
+                
+                # Способ 3: ActionChains
+                if not page_changed:
+                    print("Способ 3: ActionChains...")
+                    try:
+                        actions = ActionChains(driver)
+                        actions.move_to_element(next_btn).click().perform()
+                        time.sleep(8)
+                        
+                        # Проверяем результат
+                        new_rows = driver.find_elements(By.CSS_SELECTOR, "table#b-cases > tbody > tr")
+                        if new_rows:
+                            new_first_case = new_rows[0].find_element(By.CSS_SELECTOR, "td.num a.num_case").text.strip()
+                            if new_first_case != first_case_number:
+                                print(f"УСПЕХ: ActionChains сработал! Новое дело: {new_first_case}")
+                                page_changed = True
+                            else:
+                                print("ActionChains не сработал")
+                    except Exception as e:
+                        print(f"Ошибка при ActionChains: {e}")
+                
+                # Способ 4: Переход по номеру страницы
+                if not page_changed:
+                    print(f"Способ 4: Переход на страницу {next_page_num}...")
+                    try:
+                        # Ищем ссылку на конкретную страницу
+                        page_links = driver.find_elements(By.CSS_SELECTOR, f"ul#pages li a[href*='page={next_page_num}']")
+                        if page_links:
+                            driver.execute_script("arguments[0].click();", page_links[0])
+                            time.sleep(8)
+                            
+                            # Проверяем результат
+                            new_rows = driver.find_elements(By.CSS_SELECTOR, "table#b-cases > tbody > tr")
+                            if new_rows:
+                                new_first_case = new_rows[0].find_element(By.CSS_SELECTOR, "td.num a.num_case").text.strip()
+                                if new_first_case != first_case_number:
+                                    print(f"УСПЕХ: Переход по номеру страницы сработал! Новое дело: {new_first_case}")
+                                    page_changed = True
+                                else:
+                                    print("Переход по номеру страницы не сработал")
+                        else:
+                            print(f"Ссылка на страницу {next_page_num} не найдена")
+                    except Exception as e:
+                        print(f"Ошибка при переходе по номеру страницы: {e}")
+                
+                if not page_changed:
+                    print("НЕ УДАЛОСЬ ПЕРЕЙТИ НА СЛЕДУЮЩУЮ СТРАНИЦУ. Завершаем парсинг.")
+                    break
+                    
+                # Проверяем, не вернулись ли мы на главную страницу
+                new_url = driver.current_url
+                print(f"Новый URL: {new_url}")
+                
+                if "kad.arbitr.ru" in new_url and "search" not in new_url:
+                    print("ОШИБКА: Обнаружен возврат на главную страницу. Завершаем парсинг.")
+                    break
+                    
+                page += 1
+                print(f"УСПЕШНО перешли на страницу {page}")
+                
+            except Exception as e:
+                print(f"ОШИБКА при переходе на следующую страницу: {e}")
+                print("Завершаем парсинг.")
+                break
+                
+    except Exception as e:
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+    finally:
+        if driver:
+            print("\n=== ЗАВЕРШЕНИЕ ПАРСИНГА ===")
+            driver.quit()
+
+    if results:
+        df = pd.DataFrame(results)
+        filename = f"kad_arbitr_js_pagination_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        try:
+            df.to_excel(filename, index=False)
+            print(f"Данные успешно сохранены в {filename}")
+            print(f"Всего обработано дел: {len(results)}")
+            print(f"Всего обработано страниц: {page}")
+            
+        except Exception as e:
+            print(f"Ошибка при сохранении данных: {e}")
+    else:
+        print("Нет данных для сохранения.")
+
+
+if __name__ == "__main__":
+    main()
